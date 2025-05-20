@@ -35,23 +35,8 @@ thiserror = "1.0.37"
 wildmatch = "2.1.1"
 zip = "3.0"
 
-[dev-dependencies]
-hexdump = "0.1.1"
-httptest = "0.15"
-http = "0.2.8"
-hyper = "0.14.23"
-test-log = "0.2.11"
-criterion = "0.3"
-ripunzip_test_utils = { path = "test_utils" }
-
-[[bench]]
-name = "ripunzip_benchmark"
-harness = false
 
 [lib]
 name = "ripunzip"
 path = "src/lib.rs"
 
-
-[workspace]
-members = ["test_utils"]
