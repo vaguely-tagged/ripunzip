@@ -7,16 +7,14 @@
 // except according to those terms.
 
 mod cloneable_seekable_reader;
-mod http_range_reader;
 mod progress_updater;
-mod seekable_http_reader;
 
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     fs::File,
     io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -26,8 +24,6 @@ use zip::{read::ZipFile, ZipArchive};
 use crate::unzip::{
     cloneable_seekable_reader::CloneableSeekableReader, progress_updater::ProgressUpdater,
 };
-
-use self::seekable_http_reader::{AccessPattern, SeekableHttpReader, SeekableHttpReaderEngine};
 
 pub(crate) fn determine_stream_len<R: Seek>(stream: &mut R) -> std::io::Result<u64> {
     let old_pos = stream.stream_position()?;
@@ -129,42 +125,6 @@ impl UnzipEngineImpl for UnzipFileEngine {
     }
 }
 
-/// Engine which knows how to unzip a URI; specifically a URI fetched from
-/// an HTTP server which supports `Range` requests.
-#[derive(Clone)]
-struct UnzipUriEngine<F: Fn()>(
-    Arc<SeekableHttpReaderEngine>,
-    ZipArchive<SeekableHttpReader>,
-    F,
-);
-
-impl<F: Fn()> UnzipEngineImpl for UnzipUriEngine<F> {
-    fn unzip(
-        &mut self,
-        options: UnzipOptions,
-        directory_creator: &DirectoryCreator,
-    ) -> Vec<anyhow::Error> {
-        self.0
-            .set_expected_access_pattern(AccessPattern::SequentialIsh);
-        let result = unzip_serial_or_parallel(
-            self.1.len(),
-            options,
-            directory_creator,
-            || self.1.clone(),
-            || self.0.read_skip_expected(),
-        );
-        let stats = self.0.get_stats();
-        if stats.cache_shrinks > 0 {
-            self.2()
-        }
-        result
-    }
-
-    fn list(&self) -> Result<Vec<String>, anyhow::Error> {
-        list(&self.1)
-    }
-}
-
 impl UnzipEngine {
     /// Create an unzip engine which knows how to unzip a file.
     pub fn for_file(mut zipfile: File) -> Result<Self> {
@@ -175,58 +135,6 @@ impl UnzipEngine {
         let zipfile = CloneableSeekableReader::new(zipfile);
         Ok(Self {
             zipfile: Box::new(UnzipFileEngine(ZipArchive::new(zipfile)?)),
-            compressed_length,
-            directory_creator: DirectoryCreator::default(),
-        })
-    }
-
-    /// Create an unzip engine which knows how to unzip a URI.
-    /// Parameters:
-    /// - the URI
-    /// - unzip options
-    /// - how big a readahead buffer to create in memory.
-    /// - a progress reporter (set of callbacks)
-    /// - an additional callback to warn if performance was impaired by
-    ///   rewinding the HTTP stream. (This implies the readahead buffer was
-    ///   too small.)
-    pub fn for_uri<F: Fn() + 'static>(
-        uri: &str,
-        readahead_limit: Option<usize>,
-        callback_on_rewind: F,
-    ) -> Result<Self> {
-        let seekable_http_reader = SeekableHttpReaderEngine::new(
-            uri.to_string(),
-            readahead_limit,
-            AccessPattern::RandomAccess,
-        );
-        let (compressed_length, zipfile): (u64, Box<dyn UnzipEngineImpl>) =
-            match seekable_http_reader {
-                Ok(seekable_http_reader) => (
-                    seekable_http_reader.len(),
-                    Box::new(UnzipUriEngine(
-                        seekable_http_reader.clone(),
-                        ZipArchive::new(seekable_http_reader.create_reader())?,
-                        callback_on_rewind,
-                    )),
-                ),
-                Err(_) => {
-                    // This server probably doesn't support HTTP ranges.
-                    // Let's fall back to fetching the request into a temporary
-                    // file then unzipping.
-                    log::warn!("HTTP(S) server does not support range requests - falling back to fetching whole file.");
-                    let mut response = reqwest::blocking::get(uri)?;
-                    let mut tempfile = tempfile::tempfile()?;
-                    std::io::copy(&mut response, &mut tempfile)?;
-                    let compressed_length = determine_stream_len(&mut tempfile)?;
-                    let zipfile = CloneableSeekableReader::new(tempfile);
-                    (
-                        compressed_length,
-                        Box::new(UnzipFileEngine(ZipArchive::new(zipfile)?)),
-                    )
-                }
-            };
-        Ok(Self {
-            zipfile,
             compressed_length,
             directory_creator: DirectoryCreator::default(),
         })
@@ -494,13 +402,11 @@ impl DirectoryCreator {
 mod tests {
     use super::FilenameFilter;
     use crate::{NullProgressReporter, UnzipEngine, UnzipOptions};
-    use httptest::Server;
-    use ripunzip_test_utils::*;
     use std::{
         collections::HashSet,
         env::{current_dir, set_current_dir},
         fs::{read_to_string, File},
-        io::{Cursor, Seek, Write},
+        io::{Seek, Write},
         path::Path,
     };
     use tempfile::tempdir;
@@ -653,88 +559,6 @@ mod tests {
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect()
-        )
-    }
-
-    #[test]
-    fn test_extract_from_server() {
-        run_with_and_without_a_filename_filter(|create_a, filename_filter| {
-            let td = tempdir().unwrap();
-            let mut zip_data = Cursor::new(Vec::new());
-            create_zip(&mut zip_data, create_a, None);
-            let body = zip_data.into_inner();
-            println!("Whole zip:");
-            hexdump::hexdump(&body);
-
-            let server = Server::run();
-            set_up_server(&server, body, ServerType::Ranges);
-
-            let outdir = td.path().join("outdir");
-            let options = UnzipOptions {
-                output_directory: Some(outdir.clone()),
-                password: None,
-                single_threaded: false,
-                filename_filter,
-                progress_reporter: Box::new(NullProgressReporter),
-            };
-            UnzipEngine::for_uri(&server.url("/foo").to_string(), None, || {})
-                .unwrap()
-                .unzip(options)
-                .unwrap();
-            check_files_exist(&outdir, create_a);
-        });
-    }
-
-    fn unzip_sample_zip(zip_params: ZipParams, server_type: ServerType) {
-        let td = tempdir().unwrap();
-        let zip_data = ripunzip_test_utils::get_sample_zip(&zip_params);
-
-        let server = Server::run();
-        set_up_server(&server, zip_data, server_type);
-
-        let outdir = td.path().join("outdir");
-        let options = UnzipOptions {
-            output_directory: Some(outdir),
-            password: None,
-            single_threaded: false,
-            filename_filter: None,
-            progress_reporter: Box::new(NullProgressReporter),
-        };
-        UnzipEngine::for_uri(&server.url("/foo").to_string(), None, || {})
-            .unwrap()
-            .unzip(options)
-            .unwrap();
-    }
-
-    #[test]
-    fn test_extract_biggish_zip_from_ranges_server() {
-        unzip_sample_zip(
-            ZipParams::new(FileSizes::Variable, 15, zip::CompressionMethod::Deflated),
-            ServerType::Ranges,
-        )
-    }
-
-    #[test]
-    fn test_small_zip_from_ranges_server() {
-        unzip_sample_zip(
-            ZipParams::new(FileSizes::Variable, 3, zip::CompressionMethod::Deflated),
-            ServerType::Ranges,
-        )
-    }
-
-    #[test]
-    fn test_small_zip_from_no_range_server() {
-        unzip_sample_zip(
-            ZipParams::new(FileSizes::Variable, 3, zip::CompressionMethod::Deflated),
-            ServerType::ContentLengthButNoRanges,
-        )
-    }
-
-    #[test]
-    fn test_small_zip_from_no_content_length_server() {
-        unzip_sample_zip(
-            ZipParams::new(FileSizes::Variable, 3, zip::CompressionMethod::Deflated),
-            ServerType::NoContentLength,
         )
     }
 }
